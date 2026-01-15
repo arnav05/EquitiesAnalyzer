@@ -13,6 +13,9 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import warnings
 import time
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 warnings.filterwarnings('ignore')
 
@@ -21,6 +24,20 @@ try:
     from yfinance.exceptions import YFRateLimitError
 except ImportError:
     YFRateLimitError = None
+
+# Configure session with retries and longer timeout
+def create_session():
+    """Create a requests session with retry strategy and longer timeout."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 class SwingTradingAlgorithm:
@@ -60,28 +77,21 @@ class SwingTradingAlgorithm:
         
         # Retry logic for rate limit errors
         for attempt in range(max_retries):
-            # Add delay before each attempt (longer for first attempt)
-            if attempt == 0:
-                time.sleep(2)
-            elif attempt > 0:
-                # Already handled in the exception/empty data cases below
-                pass
+            # Add small delay before each attempt to avoid rate limits
+            if attempt > 0:
+                wait_time = retry_delay * (2 ** (attempt - 1))
+                print(f"Retry attempt {attempt + 1}/{max_retries}...")
+                time.sleep(wait_time)
             
             try:
-                # Try using Ticker object first (more reliable)
-                ticker_obj = yf.Ticker(self.ticker)
-                
-                # Download data - try both methods
-                try:
-                    self.data = ticker_obj.history(start=start_date.strftime('%Y-%m-%d'), 
-                                                   end=end_date.strftime('%Y-%m-%d'))
-                except Exception as e1:
-                    # Fallback to download method
-                    try:
-                        self.data = yf.download(self.ticker, start=start_date, end=end_date, progress=False)
-                    except Exception as e2:
-                        # If both fail, raise the first exception
-                        raise e1
+                # Use yf.download() - simpler and more reliable
+                # Note: yfinance uses requests library internally, which has default timeout
+                self.data = yf.download(
+                    self.ticker, 
+                    start=start_date, 
+                    end=end_date, 
+                    progress=False
+                )
                 
                 # Check if data is empty (could be rate limit or invalid ticker)
                 if self.data.empty or len(self.data) == 0:
@@ -92,17 +102,9 @@ class SwingTradingAlgorithm:
                         time.sleep(wait_time)
                         continue
                     else:
-                        # Verify ticker is valid (but don't fail if info is also rate limited)
-                        try:
-                            info = ticker_obj.info
-                            if info and 'symbol' in info and info.get('symbol') != self.ticker:
-                                raise ValueError(f"Invalid ticker symbol: {self.ticker}. Please check the symbol and try again.")
-                        except:
-                            pass  # If info fetch fails, assume it's rate limiting
-                        
                         raise ValueError(
                             f"No data found for ticker {self.ticker} after {max_retries} attempts. "
-                            f"This is likely due to Yahoo Finance rate limiting. Please wait 5-10 minutes and try again."
+                            f"This may be due to rate limiting or an invalid ticker. Please wait 5-10 minutes and try again."
                         )
                 
                 # Flatten multi-level columns if present (newer yfinance versions)
@@ -116,6 +118,16 @@ class SwingTradingAlgorithm:
                 error_msg = str(e)
                 error_type = type(e).__name__
                 
+                # Check if it's a timeout or connection error
+                is_timeout = (
+                    "timeout" in error_msg.lower() or
+                    "timed out" in error_msg.lower() or
+                    "Connection" in error_type or
+                    "Timeout" in error_type or
+                    "ReadTimeout" in error_type or
+                    "ConnectTimeout" in error_type
+                )
+                
                 # Check if it's a rate limit error (multiple ways yfinance can report this)
                 is_rate_limit = (
                     (YFRateLimitError is not None and isinstance(e, YFRateLimitError)) or
@@ -126,6 +138,19 @@ class SwingTradingAlgorithm:
                     "429" in error_msg or
                     "rate limit" in error_msg.lower()
                 )
+                
+                # Handle timeout errors with retry
+                if is_timeout:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)
+                        print(f"⚠️ Connection timeout. Waiting {wait_time} seconds before retry {attempt + 1}/{max_retries}...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        raise ValueError(
+                            f"❌ Connection timeout after {max_retries} attempts. "
+                            f"Please check your internet connection and try again."
+                        )
                 
                 if is_rate_limit:
                     if attempt < max_retries - 1:
